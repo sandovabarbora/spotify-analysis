@@ -12,3 +12,7 @@ pom.xml.asc
 .hgignore
 .env
 .hg/
+venv/
+*.pyc
+__pycache__/
+.DS_Store
