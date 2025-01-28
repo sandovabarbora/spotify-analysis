@@ -33,7 +33,7 @@ class EnhancedSpotifyDashboard:
             st.session_state.time_range = 'short_term'
         if 'selected_features' not in st.session_state:
             st.session_state.selected_features = ['popularity', 'engagement_score']
-    
+
     def create_plotly_figure(self, data, chart_type, **kwargs):
         """Create Plotly figure with error handling"""
         try:
@@ -147,6 +147,16 @@ class EnhancedSpotifyDashboard:
                 title="Most Played Artists",
             )
             st.plotly_chart(fig, use_container_width=True)
+
+        # Add download button for data
+        st.subheader("📥 Download Data")
+        csv_data = self.analyzer.recent.to_csv(index=False)
+        st.download_button(
+            label="Download Recent Tracks Data as CSV",
+            data=csv_data,
+            file_name="recent_tracks.csv",
+            mime="text/csv"
+        )
     
     def pattern_analysis_page(self):
         """Enhanced pattern analysis page"""
