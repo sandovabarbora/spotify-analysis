@@ -1,441 +1,265 @@
 import pandas as pd
 import numpy as np
-from datetime import datetime
-import networkx as nx
-from sklearn.ensemble import RandomForestClassifier, IsolationForest
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+import altair as alt
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans, DBSCAN
 from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans
-from sklearn.metrics.pairwise import cosine_similarity
-from scipy import stats
-import json
-import glob
-from collections import defaultdict
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+import networkx as nx
+from datetime import datetime, timedelta
 import warnings
-warnings.filterwarnings('ignore')
+from typing import Dict, List, Tuple
+from prophet import Prophet
 
-class EnhancedSpotifyAnalyzer:
-    def __init__(self, data_path='../../data/raw/'):
-        """Initialize the enhanced analyzer with data path"""
-        self.data_path = data_path
-        self.load_data()
+class SpotifyMLAnalyzer:
+    def __init__(self, data_path: str):
+        """Initialize with path to enriched Spotify data."""
+        self.df = pd.read_parquet(data_path)
+        alt.data_transformers.disable_max_rows()  # Allow larger datasets in Altair
+        self._prepare_data()
         
-    def load_data(self):
-        """Load all Spotify data with enhanced error handling and preprocessing"""
-        try:
-            # Load current data with robust CSV parsing
-            self.recent = pd.read_csv(
-                f'{self.data_path}spotify_recent_tracks.csv',
-                quoting=1,
-                escapechar='\\',
-                encoding='utf-8'
-            )
-            
-            # Add unique track identifier
-            self.recent['track_id'] = self.recent.apply(
-                lambda x: f"{x['name']}|||{x['artist']}", 
-                axis=1
-            )
-            
-            # Convert timestamps and add time-based features
-            if 'played_at' in self.recent.columns:
-                self.recent['played_at'] = pd.to_datetime(self.recent['played_at'])
-                self._add_time_features(self.recent)
-            
-            # Add sophisticated features
-            self._add_advanced_features()
-            
-            # Load top tracks data
-            self._load_top_tracks()
-            
-            # Initialize recommendation system
-            self._initialize_recommendation_system()
-            
-        except Exception as e:
-            print(f"Error loading data: {str(e)}")
-            raise
-            
-    def _load_top_tracks(self):
-        """Load and process top tracks data"""
-        def load_and_process_tracks(filename):
-            df = pd.read_csv(f'{self.data_path}{filename}')
-            df['track_id'] = df.apply(
-                lambda x: f"{x['name']}|||{x['artist']}", 
-                axis=1
-            )
-            return df
-            
-        self.top_short = load_and_process_tracks('spotify_top_tracks_short.csv')
-        self.top_medium = load_and_process_tracks('spotify_top_tracks_medium.csv')
-        self.top_long = load_and_process_tracks('spotify_top_tracks_long.csv')
-    
-    def _add_time_features(self, df):
-        """Add time-based features to a dataframe"""
-        df['hour'] = df['played_at'].dt.hour
-        df['day_of_week'] = df['played_at'].dt.dayofweek
-        df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
-        df['time_of_day'] = pd.cut(
-            df['hour'],
-            bins=[-1, 6, 12, 18, 24],
-            labels=['night', 'morning', 'afternoon', 'evening']
-        )
-    
-    def _add_advanced_features(self):
-        """Add sophisticated features for analysis"""
-        if 'played_at' in self.recent.columns:
-            # Calculate play frequency features
-            self.recent['time_diff'] = self.recent['played_at'].diff()
-            self.recent['play_frequency'] = self.recent['time_diff'].dt.total_seconds() / 3600
-        
-        # Add popularity bins for segmentation
-        self.recent['popularity_segment'] = pd.qcut(
-            self.recent['popularity'], 
-            q=5, 
-            labels=['Very Niche', 'Niche', 'Moderate', 'Popular', 'Very Popular']
-        )
-        
-        # Calculate artist diversity metrics
-        artist_counts = self.recent['artist'].value_counts()
-        self.recent['artist_frequency'] = self.recent['artist'].map(artist_counts)
-        
-        if 'time_diff' in self.recent.columns:
-            # Add session features
-            self.recent['new_session'] = self.recent['time_diff'] > pd.Timedelta(minutes=30)
-            self.recent['session_id'] = self.recent['new_session'].cumsum()
-        
-        # Calculate engagement scores
-        self._calculate_engagement_scores()
-    
-    def _calculate_engagement_scores(self):
-        """Calculate sophisticated engagement metrics"""
-        # Base engagement score using play frequency and popularity
-        self.recent['engagement_score'] = (
-            self.recent['artist_frequency'] * 
-            np.log1p(self.recent['popularity'])
-        )
-        
-        if 'hour' in self.recent.columns:
-            # Adjust for time of day preferences
-            time_weights = self.recent.groupby('hour')['engagement_score'].mean()
-            self.recent['time_weighted_engagement'] = (
-                self.recent['engagement_score'] * 
-                self.recent['hour'].map(time_weights)
-            )
-        
-        # Normalize scores
-        scaler = MinMaxScaler()
-        self.recent['engagement_score_normalized'] = scaler.fit_transform(
-            self.recent[['engagement_score']]
-        )
-    
-    def _initialize_recommendation_system(self):
-        """Initialize an advanced recommendation system"""
-        try:
-            # Combine all track data with unique track IDs
-            all_tracks = pd.concat([
-                self.recent[['name', 'artist', 'popularity', 'track_id']],
-                self.top_short[['name', 'artist', 'popularity', 'track_id']],
-                self.top_medium[['name', 'artist', 'popularity', 'track_id']],
-                self.top_long[['name', 'artist', 'popularity', 'track_id']]
-            ])
-            
-            # Remove duplicates and reset index
-            all_tracks = all_tracks.drop_duplicates('track_id').reset_index(drop=True)
-            
-            # Create base features DataFrame with proper index
-            popularity_features = pd.DataFrame(
-                MinMaxScaler().fit_transform(all_tracks[['popularity']]),
-                columns=['popularity_normalized'],
-                index=all_tracks.index
-            )
-            
-            # Create artist features with same index
-            artist_dummies = pd.get_dummies(
-                all_tracks['artist'],
-                prefix='artist'
-            )
-            artist_dummies.index = all_tracks.index
-            
-            # Combine features
-            self.track_features = pd.concat(
-                [popularity_features, artist_dummies],
-                axis=1
-            )
-            
-            # Store track mapping
-            self.tracks_list = all_tracks.copy()
-            self.track_indices = pd.Series(
-                all_tracks.index,
-                index=all_tracks['track_id']
-            )
-            
-            # Calculate similarity matrix
-            if len(self.track_features) > 1:
-                # Use PCA if we have enough features
-                n_components = min(50, len(self.track_features.columns))
-                if n_components > 0:
-                    pca = PCA(n_components=n_components)
-                    self.track_features_reduced = pca.fit_transform(self.track_features)
-                    self.similarity_matrix = cosine_similarity(self.track_features_reduced)
-                else:
-                    self.similarity_matrix = cosine_similarity(self.track_features)
-            else:
-                # If we only have one track, create a 1x1 similarity matrix
-                self.similarity_matrix = np.array([[1]])
-                
-        except Exception as e:
-            print(f"Error in recommendation system initialization: {str(e)}")
-            raise
-            
-    def get_recommendations(self, track_name, artist, n_recommendations=5):
-        """Get sophisticated music recommendations"""
-        try:
-            # Create track_id
-            track_id = f"{track_name}|||{artist}"
-            
-            # Get track index
-            if track_id not in self.track_indices.index:
-                return pd.DataFrame()  # Return empty DataFrame if track not found
-                
-            idx = self.track_indices[track_id]
-            
-            # Get similarity scores
-            sim_scores = list(enumerate(self.similarity_matrix[idx]))
-            sim_scores = sorted(sim_scores, key=lambda x: x[1], reverse=True)
-            
-            # Get top similar tracks (excluding the input track)
-            sim_scores = [s for s in sim_scores if s[0] != idx][:n_recommendations]
-            
-            if not sim_scores:
-                return pd.DataFrame()
-                
-            track_indices = [i[0] for i in sim_scores]
-            recommendations = self.tracks_list.iloc[track_indices].copy()
-            recommendations['similarity_score'] = [i[1] for i in sim_scores]
-            
-            return recommendations[['name', 'artist', 'popularity', 'similarity_score']]
-            
-        except Exception as e:
-            print(f"Error getting recommendations: {str(e)}")
-            return pd.DataFrame()
-            
-    def get_top_artists(self, n=10):
-        """Get top artists by play count"""
-        return self.recent['artist'].value_counts().head(n)
-        
-    def get_popular_tracks(self, n=10):
-        """Get most popular tracks"""
-        return self.recent.nlargest(n, 'popularity')[['name', 'artist', 'popularity']]
-        
-    def get_engagement_stats(self):
-        """Get engagement statistics"""
-        if 'engagement_score_normalized' not in self.recent.columns:
-            return {}
-            
-        return {
-            'mean_engagement': self.recent['engagement_score_normalized'].mean(),
-            'top_engaged_tracks': self.recent.nlargest(
-                5, 
-                'engagement_score_normalized'
-            )[['name', 'artist', 'engagement_score_normalized']]
-        }
-        
-    def get_listening_patterns(self):
-        """Get listening pattern statistics"""
-        patterns = {}
-        
-        if 'hour' in self.recent.columns:
-            patterns['hourly'] = self.recent['hour'].value_counts().sort_index()
-            
-        if 'day_of_week' in self.recent.columns:
-            patterns['daily'] = self.recent['day_of_week'].value_counts().sort_index()
-            
-        if 'time_of_day' in self.recent.columns:
-            patterns['time_of_day'] = self.recent['time_of_day'].value_counts()
-            
-        return patterns
-            
-    def analyze_artist_network(self):
-        """Create and analyze artist collaboration network"""
-        if 'played_at' not in self.recent.columns:
-            return nx.Graph(), {}
-            
-        G = nx.Graph()
-        
-        # Add nodes for each artist
-        artists = self.recent['artist'].unique()
-        G.add_nodes_from(artists)
-        
-        # Create edges based on temporal proximity (1 hour window)
-        artist_times = {}
-        for artist in artists:
-            artist_times[artist] = self.recent[
-                self.recent['artist'] == artist
-            ]['played_at']
-        
-        for artist1 in artists:
-            for artist2 in artists:
-                if artist1 != artist2:
-                    times1 = artist_times[artist1]
-                    times2 = artist_times[artist2]
-                    
-                    # Check if artists are played within 1 hour of each other
-                    for t1 in times1:
-                        close_plays = abs(times2 - t1) <= pd.Timedelta(hours=1)
-                        if close_plays.any():
-                            if G.has_edge(artist1, artist2):
-                                G[artist1][artist2]['weight'] += 1
-                            else:
-                                G.add_edge(artist1, artist2, weight=1)
-        
-        # Calculate network metrics if the graph is not empty
-        if len(G.nodes()) > 0:
-            metrics = {
-                'centrality': nx.degree_centrality(G),
-                'betweenness': nx.betweenness_centrality(G)
-            }
-            
-            # Only calculate communities if we have enough nodes
-            if len(G.nodes()) > 2:
-                try:
-                    metrics['communities'] = list(
-                        nx.community.greedy_modularity_communities(G)
-                    )
-                except:
-                    metrics['communities'] = []
-        else:
-            metrics = {
-                'centrality': {},
-                'betweenness': {},
-                'communities': []
-            }
-        
-        return G, metrics
+    def _prepare_data(self):
+        """Prepare data for analysis."""
+        # Time features
+        self.df['ts'] = pd.to_datetime(self.df['ts'])
+        self.df['hour'] = self.df['ts'].dt.hour
+        self.df['day_name'] = self.df['ts'].dt.day_name()
+        self.df['month'] = self.df['ts'].dt.month
+        self.df['year'] = self.df['ts'].dt.year
+        self.df['day_of_week'] = self.df['ts'].dt.dayofweek
+        self.df['minutes_played'] = self.df['ms_played'] / 60000
 
-    def analyze_listening_patterns(self):
-            """Enhanced analysis of listening patterns using ML"""
-            if len(self.recent) < 10:
-                return "Insufficient data for analysis"
-            
-            # Prepare features for clustering
-            features = ['hour', 'day_of_week', 'popularity']
-            if 'engagement_score_normalized' in self.recent.columns:
-                features.append('engagement_score_normalized')
-                
-            X = self.recent[features].copy()
-            
-            # Handle missing values
-            X = X.fillna(X.mean())
-            
-            # Scale features
-            scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(X)
-            
-            # Perform clustering
-            kmeans = KMeans(n_clusters=min(5, len(X)), random_state=42)
-            self.recent['listening_cluster'] = kmeans.fit_predict(X_scaled)
-            
-            # Analyze clusters
-            cluster_insights = []
-            for cluster in range(len(kmeans.cluster_centers_)):
-                cluster_data = self.recent[self.recent['listening_cluster'] == cluster]
-                
-                insight = {
-                    'cluster': cluster,
-                    'size': len(cluster_data),
-                    'avg_popularity': cluster_data['popularity'].mean(),
-                    'peak_hours': cluster_data['hour'].mode().tolist()[:3] if 'hour' in cluster_data.columns else [],
-                    'common_artists': cluster_data['artist'].value_counts().head(3).to_dict()
-                }
-                cluster_insights.append(insight)
-            
-            return cluster_insights
-
-    def detect_anomalies(self):
-        """Detect unusual listening patterns"""
-        features = ['popularity']
-        if 'engagement_score_normalized' in self.recent.columns:
-            features.append('engagement_score_normalized')
-        if 'play_frequency' in self.recent.columns:
-            features.append('play_frequency')
-            
-        X = self.recent[features].fillna(0)
+    def cluster_tracks(self) -> Tuple[Dict, alt.Chart]:
+        """Perform ML-based track clustering using audio features."""
+        features = ['danceability', 'energy', 'valence', 'tempo', 'instrumentalness', 
+                   'acousticness', 'liveness', 'speechiness']
         
-        if len(X) < 10:
-            return pd.DataFrame()  # Return empty DataFrame if insufficient data
-            
-        # Use Isolation Forest for anomaly detection
-        iso_forest = IsolationForest(contamination=0.1, random_state=42)
-        anomalies = iso_forest.fit_predict(X)
+        if not all(feat in self.df.columns for feat in features):
+            return {}, None
         
-        # Identify anomalous tracks
-        self.recent['is_anomaly'] = anomalies == -1
-        anomalous_tracks = self.recent[self.recent['is_anomaly']].copy()
+        # Prepare feature matrix
+        X = self.df[features].copy()
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
         
-        return anomalous_tracks[['name', 'artist', 'popularity', 'played_at']]
-
-    def generate_insights(self):
-        """Generate comprehensive insights using ML"""
-        insights = []
+        # Perform PCA for visualization
+        pca = PCA(n_components=2)
+        X_pca = pca.fit_transform(X_scaled)
         
-        # Analyze listening patterns
-        patterns = self.analyze_listening_patterns()
-        if patterns != "Insufficient data for analysis":
-            insights.append({
-                'type': 'listening_patterns',
-                'patterns': patterns
-            })
+        # Clustering
+        kmeans = KMeans(n_clusters=5, random_state=42)
+        clusters = kmeans.fit_predict(X_scaled)
         
-        # Detect anomalies
-        anomalies = self.detect_anomalies()
-        if not anomalies.empty:
-            insights.append({
-                'type': 'anomalies',
-                'tracks': anomalies.to_dict('records')
-            })
-        
-        # Calculate diversity metrics
-        artist_diversity = len(self.recent['artist'].unique()) / len(self.recent)
-        time_diversity = self.recent['hour'].nunique() / 24 if 'hour' in self.recent.columns else 0
-        
-        insights.append({
-            'type': 'diversity_metrics',
-            'artist_diversity': artist_diversity,
-            'time_diversity': time_diversity
+        # Prepare visualization data
+        viz_df = pd.DataFrame({
+            'PCA1': X_pca[:, 0],
+            'PCA2': X_pca[:, 1],
+            'Cluster': clusters.astype(str),
+            'Track': self.df['master_metadata_track_name'],
+            'Artist': self.df['master_metadata_album_artist_name']
         })
         
-        # Generate personalized recommendations
-        if len(self.recent) > 0:
-            recent_track = self.recent.iloc[0]
-            recommendations = self.get_recommendations(
-                recent_track['name'], 
-                recent_track['artist']
-            )
-            if not recommendations.empty:
-                insights.append({
-                    'type': 'recommendations',
-                    'based_on': recent_track['name'],
-                    'tracks': recommendations.to_dict('records')
-                })
+        # Create Altair visualization
+        cluster_chart = alt.Chart(viz_df).mark_circle(size=60).encode(
+            x='PCA1:Q',
+            y='PCA2:Q',
+            color='Cluster:N',
+            tooltip=['Track', 'Artist', 'Cluster']
+        ).properties(
+            width=600,
+            height=400,
+            title='Track Clusters Based on Audio Features'
+        ).interactive()
         
-        return insights
+        # Analyze cluster characteristics
+        cluster_stats = self.df.copy()
+        cluster_stats['cluster'] = clusters
+        cluster_profiles = cluster_stats.groupby('cluster')[features].mean()
+        
+        # Get most representative tracks for each cluster
+        cluster_examples = {}
+        for i in range(len(cluster_profiles)):
+            cluster_tracks = cluster_stats[cluster_stats['cluster'] == i]
+            cluster_examples[i] = cluster_tracks[['master_metadata_track_name', 
+                                               'master_metadata_album_artist_name']].head(5).to_dict('records')
+        
+        return {
+            'cluster_profiles': cluster_profiles.to_dict(),
+            'cluster_examples': cluster_examples,
+            'feature_importance': dict(zip(features, abs(pca.components_[0])))
+        }, cluster_chart
 
-def main():
-    analyzer = EnhancedSpotifyAnalyzer()
-    
-    # Generate comprehensive analysis
-    insights = analyzer.generate_insights()
-    print("\nKey Insights:")
-    for insight in insights:
-        print(f"\n{insight['type'].upper()}:")
-        print(json.dumps(insight, indent=2))
+    def predict_listening_patterns(self) -> Tuple[Dict, alt.Chart]:
+        """Predict future listening patterns using Prophet."""
+        # Prepare daily listening data
+        daily_streams = self.df.groupby(self.df['ts'].dt.date).size().reset_index()
+        daily_streams.columns = ['ds', 'y']
         
-    # Get recommendations for a sample track
-    if len(analyzer.recent) > 0:
-        sample_track = analyzer.recent.iloc[0]
-        print(f"\nRecommendations based on '{sample_track['name']}':")
-        recs = analyzer.get_recommendations(sample_track['name'], sample_track['artist'])
-        print(recs if not recs.empty else "No recommendations found")
+        # Train Prophet model
+        model = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=True)
+        model.fit(daily_streams)
+        
+        # Make predictions for next 30 days
+        future = model.make_future_dataframe(periods=30)
+        forecast = model.predict(future)
+        
+        # Prepare visualization data
+        viz_df = pd.concat([
+            daily_streams.assign(type='Historical'),
+            pd.DataFrame({
+                'ds': forecast.ds.tail(30),
+                'y': forecast.yhat.tail(30)
+            }).assign(type='Predicted')
+        ])
+        
+        # Create Altair visualization
+        forecast_chart = alt.Chart(viz_df).mark_line(point=True).encode(
+            x='ds:T',
+            y='y:Q',
+            color='type:N',
+            tooltip=['ds', 'y']
+        ).properties(
+            width=800,
+            height=400,
+            title='Listening Pattern Prediction'
+        ).interactive()
+        
+        # Extract insights
+        seasonality = {
+            'weekly': dict(zip(range(7), model.weekly.effect)),
+            'yearly': dict(zip(range(1, 13), model.yearly.effect)),
+            'daily': dict(zip(range(24), model.daily.effect))
+        }
+        
+        return {
+            'forecast': forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail(30).to_dict('records'),
+            'seasonality': seasonality
+        }, forecast_chart
+
+    def analyze_genre_evolution(self) -> Tuple[Dict, List[alt.Chart]]:
+        """Analyze how genre preferences evolve over time."""
+        if 'artist_genres' not in self.df.columns:
+            return {}, []
+            
+        # Explode genres and create time-based aggregations
+        genres_df = self.df.explode('artist_genres')
+        monthly_genres = genres_df.groupby([
+            pd.Grouper(key='ts', freq='M'),
+            'artist_genres'
+        ]).size().reset_index(name='count')
+        
+        # Get top genres for each month
+        top_monthly = (monthly_genres.sort_values('count', ascending=False)
+                      .groupby(pd.Grouper(key='ts', freq='M'))
+                      .head(5))
+        
+        # Create genre evolution chart
+        evolution_chart = alt.Chart(monthly_genres).mark_area().encode(
+            x='ts:T',
+            y='count:Q',
+            color='artist_genres:N',
+            tooltip=['artist_genres', 'count']
+        ).properties(
+            width=800,
+            height=400,
+            title='Genre Evolution Over Time'
+        ).interactive()
+        
+        # Create genre diversity chart
+        diversity_by_month = genres_df.groupby(pd.Grouper(key='ts', freq='M'))['artist_genres'].nunique()
+        diversity_df = pd.DataFrame({
+            'Month': diversity_by_month.index,
+            'Unique_Genres': diversity_by_month.values
+        })
+        
+        diversity_chart = alt.Chart(diversity_df).mark_line(point=True).encode(
+            x='Month:T',
+            y='Unique_Genres:Q',
+            tooltip=['Month', 'Unique_Genres']
+        ).properties(
+            width=800,
+            height=300,
+            title='Genre Diversity Over Time'
+        ).interactive()
+        
+        # Calculate genre transition probabilities
+        genre_transitions = []
+        for session_id, group in self.df.groupby('session_id'):
+            genres = group.explode('artist_genres')['artist_genres'].tolist()
+            for i in range(len(genres)-1):
+                if genres[i] and genres[i+1]:  # Check for valid genres
+                    genre_transitions.append((genres[i], genres[i+1]))
+                    
+        transition_df = pd.DataFrame(genre_transitions, columns=['from_genre', 'to_genre'])
+        transition_probs = (transition_df.groupby('from_genre')['to_genre']
+                          .value_counts(normalize=True)
+                          .unstack(fill_value=0))
+        
+        return {
+            'top_genres_by_month': top_monthly.to_dict('records'),
+            'genre_diversity_trend': diversity_by_month.to_dict(),
+            'genre_transitions': transition_probs.to_dict(),
+            'emerging_genres': self._find_emerging_genres(monthly_genres)
+        }, [evolution_chart, diversity_chart]
+
+    def _find_emerging_genres(self, monthly_genres: pd.DataFrame) -> Dict:
+        """Identify emerging genres based on growth rate."""
+        # Calculate genre growth rates
+        genre_growth = monthly_genres.pivot(index='ts', columns='artist_genres', values='count')
+        genre_growth = genre_growth.fillna(0)
+        growth_rates = (genre_growth.iloc[-1] - genre_growth.iloc[0]) / genre_growth.iloc[0]
+        growth_rates = growth_rates.replace([np.inf, -np.inf], np.nan).dropna()
+        
+        return {
+            'fastest_growing': growth_rates.nlargest(10).to_dict(),
+            'declining': growth_rates.nsmallest(10).to_dict()
+        }
+
+    def generate_ml_insights(self) -> Dict:
+        """Generate comprehensive ML-based insights."""
+        cluster_results, cluster_viz = self.cluster_tracks()
+        forecast_results, forecast_viz = self.predict_listening_patterns()
+        genre_results, genre_viz = self.analyze_genre_evolution()
+        
+        return {
+            'track_clustering': {
+                'results': cluster_results,
+                'visualization': cluster_viz
+            },
+            'listening_forecast': {
+                'results': forecast_results,
+                'visualization': forecast_viz
+            },
+            'genre_evolution': {
+                'results': genre_results,
+                'visualizations': genre_viz
+            }
+        }
 
 if __name__ == "__main__":
-    main()
+    analyzer = SpotifyMLAnalyzer("data/processed/enriched_history.parquet")
+    insights = analyzer.generate_ml_insights()
+    
+    # Print some key insights
+    print("\n🎵 Advanced ML-Based Spotify Analysis Report 🎵")
+    print("=" * 50)
+    
+    if insights['track_clustering']['results']:
+        print("\nTrack Clusters:")
+        for cluster, profile in insights['track_clustering']['results']['cluster_profiles'].items():
+            print(f"\nCluster {cluster} characteristics:")
+            for feature, value in profile.items():
+                print(f"- {feature}: {value:.3f}")
+    
+    if insights['listening_forecast']['results']:
+        print("\nListening Forecast:")
+        forecast = insights['listening_forecast']['results']['forecast'][0]
+        print(f"Next day prediction: {forecast['yhat']:.0f} tracks")
+        print(f"Prediction range: {forecast['yhat_lower']:.0f} - {forecast['yhat_upper']:.0f} tracks")
+    
+    if insights['genre_evolution']['results']:
+        print("\nEmerging Genres:")
+        emerging = insights['genre_evolution']['results']['emerging_genres']['fastest_growing']
+        for genre, growth in list(emerging.items())[:5]:
+            print(f"- {genre}: {growth:.1%} growth")

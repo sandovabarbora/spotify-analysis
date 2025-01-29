@@ -1,406 +1,333 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
-import logging
-from sklearn.preprocessing import StandardScaler
-import networkx as nx
-from spotify_analyzer import EnhancedSpotifyAnalyzer
+import altair as alt
+from pathlib import Path
+import datetime
+from spotify_ml_analyzer import SpotifyMLAnalyzer
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-class EnhancedSpotifyDashboard:
+class SpotifyAnalysisDashboard:
     def __init__(self):
-        """Initialize the enhanced dashboard"""
         st.set_page_config(
-            page_title="Enhanced Spotify Analysis Dashboard",
+            page_title="Spotify Listening Analysis",
+            page_icon="🎵",
             layout="wide",
             initial_sidebar_state="expanded"
         )
         
-        # Initialize analyzer and state
-        self.analyzer = EnhancedSpotifyAnalyzer()
-        self.initialize_session_state()
+        # Initialize analyzer
+        self.analyzer = SpotifyMLAnalyzer("data/processed/enriched_history.parquet")
         
-    def initialize_session_state(self):
-        """Initialize session state variables"""
-        if 'time_range' not in st.session_state:
-            st.session_state.time_range = 'short_term'
-        if 'selected_features' not in st.session_state:
-            st.session_state.selected_features = ['popularity', 'engagement_score']
+        # Set up page structure
+        self.setup_sidebar()
+        self.main_content()
 
-    def create_plotly_figure(self, data, chart_type, **kwargs):
-        """Create Plotly figure with error handling"""
-        try:
-            if isinstance(data, pd.DataFrame) and data.empty:
-                return go.Figure()
-
-            fig = None
-            
-            if chart_type == "line":
-                fig = px.line(data, **kwargs)
-            elif chart_type == "bar":
-                fig = px.bar(data, **kwargs)
-            elif chart_type == "scatter":
-                fig = px.scatter(data, **kwargs)
-            elif chart_type == "histogram":
-                fig = px.histogram(data, **kwargs)
-            else:
-                logger.error(f"Unknown chart type: {chart_type}")
-                return go.Figure()
-            
-            # Update layout
-            fig.update_layout(
-                template="plotly_dark",
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                margin=dict(l=20, r=20, t=40, b=20),
-                hovermode='closest'
+    def setup_sidebar(self):
+        """Configure sidebar with filters and navigation."""
+        st.sidebar.title("Navigation")
+        
+        # Page selection
+        self.current_page = st.sidebar.radio(
+            "Choose Analysis",
+            ["Overview", "ML Insights", "Listening Patterns", 
+             "Genre Analysis", "Artist Network", "Track Analysis"]
+        )
+        
+        st.sidebar.title("Filters")
+        
+        # Date range selector
+        self.date_range = st.sidebar.date_input(
+            "Select Date Range",
+            value=(
+                self.analyzer.df['ts'].min().date(),
+                self.analyzer.df['ts'].max().date()
+            ),
+            min_value=self.analyzer.df['ts'].min().date(),
+            max_value=self.analyzer.df['ts'].max().date()
+        )
+        
+        # Genre filter (if available)
+        if 'artist_genres' in self.analyzer.df.columns:
+            all_genres = set()
+            for genres in self.analyzer.df['artist_genres'].dropna():
+                all_genres.update(genres)
+            self.selected_genres = st.sidebar.multiselect(
+                "Filter by Genres",
+                options=sorted(all_genres),
+                default=[]
             )
-            
-            return fig
-            
-        except Exception as e:
-            logger.error(f"Error creating chart: {str(e)}")
-            return go.Figure()
-    
+        
+        # Minimum popularity filter
+        self.min_popularity = st.sidebar.slider(
+            "Minimum Track Popularity",
+            min_value=0,
+            max_value=100,
+            value=0
+        )
+
+    def main_content(self):
+        """Display main content based on selected page."""
+        if self.current_page == "Overview":
+            self.overview_page()
+        elif self.current_page == "ML Insights":
+            self.ml_insights_page()
+        elif self.current_page == "Listening Patterns":
+            self.patterns_page()
+        elif self.current_page == "Genre Analysis":
+            self.genre_page()
+        elif self.current_page == "Artist Network":
+            self.artist_network_page()
+        elif self.current_page == "Track Analysis":
+            self.track_analysis_page()
+
     def overview_page(self):
-        """Enhanced overview page with ML insights"""
-        st.header("🎵 Advanced Music Analysis")
+        """Display overview statistics and key metrics."""
+        st.title("🎵 Your Spotify Listening Overview")
         
-        # Get insights
-        insights = self.analyzer.generate_insights()
-        
-        # Key Metrics Row
+        # Key metrics in columns
         col1, col2, col3, col4 = st.columns(4)
         
+        filtered_df = self.get_filtered_df()
+        
         with col1:
-            total_tracks = len(self.analyzer.recent)
-            st.metric("Total Tracks", total_tracks)
+            st.metric(
+                "Total Tracks Played",
+                f"{len(filtered_df):,}"
+            )
             
         with col2:
-            unique_artists = self.analyzer.recent['artist'].nunique()
-            st.metric("Unique Artists", unique_artists)
+            unique_tracks = filtered_df['spotify_track_uri'].nunique()
+            st.metric(
+                "Unique Tracks",
+                f"{unique_tracks:,}"
+            )
             
         with col3:
-            if 'engagement_score_normalized' in self.analyzer.recent.columns:
-                avg_engagement = self.analyzer.recent['engagement_score_normalized'].mean()
-                st.metric("Avg Engagement", f"{avg_engagement:.2f}")
+            total_time = filtered_df['minutes_played'].sum()
+            st.metric(
+                "Hours Listened",
+                f"{total_time/60:,.1f}"
+            )
             
         with col4:
-            diversity_metrics = next(
-                (i for i in insights if i['type'] == 'diversity_metrics'), 
-                None
+            unique_artists = filtered_df['master_metadata_album_artist_name'].nunique()
+            st.metric(
+                "Unique Artists",
+                f"{unique_artists:,}"
             )
-            if diversity_metrics:
-                st.metric(
-                    "Music Diversity", 
-                    f"{diversity_metrics['artist_diversity']:.1%}"
-                )
         
-        # Listening Patterns
-        st.subheader("🎧 Listening Pattern Analysis")
-        patterns = next(
-            (i for i in insights if i['type'] == 'listening_patterns'), 
-            None
+        # Listening trends
+        st.subheader("Listening Activity Over Time")
+        daily_streams = (
+            filtered_df.groupby(filtered_df['ts'].dt.date)
+            .size()
+            .reset_index(name='streams')
         )
         
-        if patterns and patterns['patterns']:
-            # Create DataFrame for visualization
-            pattern_data = pd.DataFrame(patterns['patterns'])
-            
-            fig = self.create_plotly_figure(
-                pattern_data,
-                "scatter",
-                x="avg_popularity",
-                y="size",
-                size="size",
-                color="cluster",
-                title="Listening Clusters Analysis",
-                labels={
-                    "avg_popularity": "Average Popularity",
-                    "size": "Number of Tracks"
-                }
-            )
-            st.plotly_chart(fig, use_container_width=True)
+        trend_chart = alt.Chart(daily_streams).mark_line().encode(
+            x=alt.X('ts:T', title='Date'),
+            y=alt.Y('streams:Q', title='Tracks Played'),
+            tooltip=['ts', 'streams']
+        ).properties(
+            width=800,
+            height=400
+        ).interactive()
         
-        # Top Artists Chart
-        st.subheader("👨‍🎤 Top Artists")
-        top_artists = self.analyzer.get_top_artists()
-        if not top_artists.empty:
-            artist_data = pd.DataFrame({
-                'artist': top_artists.index,
-                'plays': top_artists.values
-            })
-            
-            fig = self.create_plotly_figure(
-                artist_data,
-                "bar",
-                x="plays",
-                y="artist",
-                orientation='h',
-                title="Most Played Artists",
+        st.altair_chart(trend_chart, use_container_width=True)
+        
+        # Top artists and tracks
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Top Artists")
+            top_artists = (
+                filtered_df['master_metadata_album_artist_name']
+                .value_counts()
+                .head(10)
             )
-            st.plotly_chart(fig, use_container_width=True)
+            
+            artist_chart = alt.Chart(
+                pd.DataFrame({
+                    'Artist': top_artists.index,
+                    'Plays': top_artists.values
+                })
+            ).mark_bar().encode(
+                y=alt.Y('Artist:N', sort='-x'),
+                x='Plays:Q',
+                tooltip=['Artist', 'Plays']
+            ).properties(
+                height=300
+            )
+            
+            st.altair_chart(artist_chart, use_container_width=True)
+            
+        with col2:
+            st.subheader("Top Tracks")
+            top_tracks = (
+                filtered_df['master_metadata_track_name']
+                .value_counts()
+                .head(10)
+            )
+            
+            track_chart = alt.Chart(
+                pd.DataFrame({
+                    'Track': top_tracks.index,
+                    'Plays': top_tracks.values
+                })
+            ).mark_bar().encode(
+                y=alt.Y('Track:N', sort='-x'),
+                x='Plays:Q',
+                tooltip=['Track', 'Plays']
+            ).properties(
+                height=300
+            )
+            
+            st.altair_chart(track_chart, use_container_width=True)
 
-        # Add download button for data
-        st.subheader("📥 Download Data")
-        csv_data = self.analyzer.recent.to_csv(index=False)
-        st.download_button(
-            label="Download Recent Tracks Data as CSV",
-            data=csv_data,
-            file_name="recent_tracks.csv",
-            mime="text/csv"
+    def ml_insights_page(self):
+        """Display machine learning based insights."""
+        st.title("🤖 ML-Powered Insights")
+        
+        # Track clustering
+        st.header("Track Clustering")
+        cluster_results, cluster_viz = self.analyzer.cluster_tracks()
+        if cluster_viz:
+            st.altair_chart(cluster_viz, use_container_width=True)
+            
+            # Show cluster characteristics
+            if cluster_results:
+                st.subheader("Cluster Characteristics")
+                for cluster, profile in cluster_results['cluster_profiles'].items():
+                    with st.expander(f"Cluster {cluster}"):
+                        st.write("Audio Features:")
+                        for feature, value in profile.items():
+                            st.write(f"- {feature}: {value:.3f}")
+                        
+                        st.write("\nExample Tracks:")
+                        for track in cluster_results['cluster_examples'][cluster]:
+                            st.write(f"- {track['master_metadata_track_name']} by {track['master_metadata_album_artist_name']}")
+        
+        # Listening predictions
+        st.header("Listening Pattern Predictions")
+        forecast_results, forecast_viz = self.analyzer.predict_listening_patterns()
+        if forecast_viz:
+            st.altair_chart(forecast_viz, use_container_width=True)
+            
+            with st.expander("Seasonality Insights"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.write("Weekly Pattern")
+                    days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+                    weekly = forecast_results['seasonality']['weekly']
+                    st.bar_chart(pd.Series(weekly, index=days))
+                
+                with col2:
+                    st.write("Daily Pattern")
+                    hours = [f"{h:02d}:00" for h in range(24)]
+                    daily = forecast_results['seasonality']['daily']
+                    st.bar_chart(pd.Series(daily, index=hours))
+
+    def patterns_page(self):
+        """Display listening pattern analysis."""
+        st.title("📊 Listening Pattern Analysis")
+        
+        filtered_df = self.get_filtered_df()
+        
+        # Hourly patterns
+        st.header("Time of Day Patterns")
+        hourly_counts = filtered_df['hour'].value_counts().sort_index()
+        
+        hour_chart = alt.Chart(
+            pd.DataFrame({
+                'Hour': hourly_counts.index,
+                'Plays': hourly_counts.values
+            })
+        ).mark_line(point=True).encode(
+            x=alt.X('Hour:Q', scale=alt.Scale(domain=[0, 23])),
+            y='Plays:Q',
+            tooltip=['Hour', 'Plays']
+        ).properties(
+            width=800,
+            height=400,
+            title="Listening by Hour of Day"
+        ).interactive()
+        
+        st.altair_chart(hour_chart, use_container_width=True)
+        
+        # Weekly patterns
+        st.header("Day of Week Patterns")
+        daily_counts = filtered_df['day_name'].value_counts()
+        days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        daily_counts = daily_counts.reindex(days)
+        
+        day_chart = alt.Chart(
+            pd.DataFrame({
+                'Day': daily_counts.index,
+                'Plays': daily_counts.values
+            })
+        ).mark_bar().encode(
+            x='Day:N',
+            y='Plays:Q',
+            tooltip=['Day', 'Plays']
+        ).properties(
+            width=800,
+            height=400,
+            title="Listening by Day of Week"
         )
-    
-    def pattern_analysis_page(self):
-        """Enhanced pattern analysis page"""
-        st.header("📊 Listening Patterns Deep Dive")
         
-        patterns = self.analyzer.get_listening_patterns()
+        st.altair_chart(day_chart, use_container_width=True)
+
+    def genre_page(self):
+        """Display genre analysis."""
+        st.title("🎸 Genre Evolution Analysis")
         
-        if patterns:
+        genre_results, genre_viz = self.analyzer.analyze_genre_evolution()
+        
+        if genre_viz:
+            # Genre evolution chart
+            st.header("Genre Trends Over Time")
+            st.altair_chart(genre_viz[0], use_container_width=True)
+            
+            # Genre diversity
+            st.header("Genre Diversity")
+            st.altair_chart(genre_viz[1], use_container_width=True)
+            
+            # Emerging genres
+            st.header("Emerging Genres")
             col1, col2 = st.columns(2)
             
             with col1:
-                # Hourly distribution
-                if 'hourly' in patterns:
-                    hourly_data = pd.DataFrame({
-                        'hour': patterns['hourly'].index,
-                        'plays': patterns['hourly'].values
-                    })
-                    
-                    fig = self.create_plotly_figure(
-                        hourly_data,
-                        "line",
-                        x="hour",
-                        y="plays",
-                        title="Hourly Listening Pattern"
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
+                st.subheader("Fastest Growing")
+                emerging = genre_results['emerging_genres']['fastest_growing']
+                for genre, growth in list(emerging.items())[:5]:
+                    st.write(f"- {genre}: {growth:.1%} growth")
             
             with col2:
-                # Daily distribution
-                if 'daily' in patterns:
-                    daily_data = pd.DataFrame({
-                        'day': patterns['daily'].index,
-                        'plays': patterns['daily'].values
-                    })
-                    
-                    fig = self.create_plotly_figure(
-                        daily_data,
-                        "bar",
-                        x="day",
-                        y="plays",
-                        title="Daily Listening Pattern"
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
+                st.subheader("Declining")
+                declining = genre_results['emerging_genres']['declining']
+                for genre, decline in list(declining.items())[:5]:
+                    st.write(f"- {genre}: {decline:.1%} decline")
+
+    def get_filtered_df(self) -> pd.DataFrame:
+        """Get DataFrame filtered by sidebar selections."""
+        df = self.analyzer.df.copy()
         
-        # Engagement Analysis
-        st.subheader("🎯 Engagement Analysis")
-        engagement_stats = self.analyzer.get_engagement_stats()
+        # Date filter
+        if len(self.date_range) == 2:
+            mask = (df['ts'].dt.date >= self.date_range[0]) & \
+                   (df['ts'].dt.date <= self.date_range[1])
+            df = df[mask]
         
-        if engagement_stats:
-            if 'top_engaged_tracks' in engagement_stats:
-                top_engaged = engagement_stats['top_engaged_tracks']
-                if not top_engaged.empty:
-                    st.write("Top Engaged Tracks:")
-                    st.dataframe(top_engaged)
-    
-    def recommendation_page(self):
-        """Enhanced recommendation page"""
-        st.header("🎵 Smart Music Recommendations")
+        # Genre filter
+        if hasattr(self, 'selected_genres') and self.selected_genres:
+            df = df[df['artist_genres'].apply(
+                lambda x: any(genre in x for genre in self.selected_genres)
+            )]
         
-        # Track selector
-        if not self.analyzer.recent.empty:
-            # Create track selection with both name and artist
-            track_data = self.analyzer.recent[['name', 'artist']].drop_duplicates()
-            track_options = [
-                f"{row['name']} - {row['artist']}" 
-                for _, row in track_data.iterrows()
-            ]
-            
-            selected = st.selectbox(
-                "Select a track:",
-                options=track_options
-            )
-            
-            if selected:
-                # Split the selection back into name and artist
-                selected_track, selected_artist = selected.split(" - ", 1)
-                
-                # Get recommendations
-                recommendations = self.analyzer.get_recommendations(
-                    selected_track,
-                    selected_artist
-                )
-                
-                if not recommendations.empty:
-                    st.subheader("Recommended Tracks")
-                    
-                    # Create visualization
-                    fig = self.create_plotly_figure(
-                        recommendations,
-                        "bar",
-                        x="name",
-                        y="similarity_score",
-                        color="popularity",
-                        title="Track Recommendations",
-                        labels={
-                            "similarity_score": "Similarity Score",
-                            "name": "Track Name"
-                        }
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    # Display detailed recommendations
-                    st.dataframe(recommendations)
-                else:
-                    st.info("No recommendations found for this track.")
-        else:
-            st.info("No tracks available for recommendations.")
-    
-    def artist_network_page(self):
-        """Artist network analysis page"""
-        st.header("🎸 Artist Connections")
+        # Popularity filter
+        if 'popularity' in df.columns:
+            df = df[df['popularity'] >= self.min_popularity]
         
-        # Create network visualization
-        artist_counts = self.analyzer.get_top_artists()
-        if not artist_counts.empty:
-            # Create network
-            G = nx.Graph()
-            
-            # Add nodes
-            for artist, count in artist_counts.items():
-                G.add_node(artist, size=count)
-            
-            # Add edges based on co-occurrence
-            for artist1 in G.nodes():
-                for artist2 in G.nodes():
-                    if artist1 < artist2:  # Avoid duplicate edges
-                        # Count co-occurrences within same session
-                        if 'session_id' in self.analyzer.recent.columns:
-                            cooccurrences = len(
-                                self.analyzer.recent[
-                                    self.analyzer.recent['session_id'].isin(
-                                        self.analyzer.recent[
-                                            self.analyzer.recent['artist'] == artist1
-                                        ]['session_id']
-                                    ) &
-                                    (self.analyzer.recent['artist'] == artist2)
-                                ]
-                            )
-                            
-                            if cooccurrences > 0:
-                                G.add_edge(artist1, artist2, weight=cooccurrences)
-            
-            # Create positions for visualization
-            pos = nx.spring_layout(G)
-            
-            # Create traces for visualization
-            edge_trace = go.Scatter(
-                x=[],
-                y=[],
-                line=dict(width=0.5, color='#888'),
-                hoverinfo='none',
-                mode='lines'
-            )
-            
-            # Add edges
-            for edge in G.edges():
-                x0, y0 = pos[edge[0]]
-                x1, y1 = pos[edge[1]]
-                edge_trace['x'] += tuple([x0, x1, None])
-                edge_trace['y'] += tuple([y0, y1, None])
-            
-            # Create node trace
-            node_trace = go.Scatter(
-                x=[],
-                y=[],
-                text=[],
-                mode='markers+text',
-                hoverinfo='text',
-                marker=dict(
-                    size=[],
-                    color=[],
-                    colorscale='Viridis',
-                    line_width=2
-                )
-            )
-            
-            # Add nodes
-            for node in G.nodes():
-                x, y = pos[node]
-                node_trace['x'] += tuple([x])
-                node_trace['y'] += tuple([y])
-                node_trace['text'] += tuple([node])
-                node_trace['marker']['size'] += tuple([G.nodes[node]['size'] * 2])
-            
-            # Create figure
-            fig = go.Figure(
-                data=[edge_trace, node_trace],
-                layout=go.Layout(
-                    title='Artist Connection Network',
-                    showlegend=False,
-                    hovermode='closest',
-                    margin=dict(b=20, l=5, r=5, t=40),
-                    paper_bgcolor='rgba(0,0,0,0)',
-                    plot_bgcolor='rgba(0,0,0,0)'
-                )
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No artist network data available.")
-    
-    def run(self):
-        """Main dashboard execution"""
-        st.sidebar.title("Navigation")
-        
-        # Navigation
-        page = st.sidebar.radio(
-            "Select Page",
-            ["Overview", "Pattern Analysis", "Recommendations", "Artist Network"]
-        )
-        
-        # Time range selector
-        st.sidebar.subheader("Time Range")
-        time_range = st.sidebar.selectbox(
-            "Select time range",
-            ["short_term", "medium_term", "long_term"],
-            key="time_range"
-        )
-        
-        # Feature selector
-        st.sidebar.subheader("Analysis Features")
-        available_features = ['popularity']
-        if 'engagement_score' in self.analyzer.recent.columns:
-            available_features.append('engagement_score')
-        if 'play_frequency' in self.analyzer.recent.columns:
-            available_features.append('play_frequency')
-            
-        selected_features = st.sidebar.multiselect(
-            "Select features to analyze",
-            available_features,
-            default=st.session_state.selected_features,
-            key="selected_features"
-        )
-        
-        # Page routing
-        if page == "Overview":
-            self.overview_page()
-        elif page == "Pattern Analysis":
-            self.pattern_analysis_page()
-        elif page == "Recommendations":
-            self.recommendation_page()
-        else:
-            self.artist_network_page()
+        return df
 
 if __name__ == "__main__":
-    dashboard = EnhancedSpotifyDashboard()
-    dashboard.run()
+    dashboard = SpotifyAnalysisDashboard()
